@@ -152,11 +152,245 @@ class ReviewTests(unittest.TestCase):
         args.runtime.mkdir(exist_ok=True)
         rows, errors = io.StringIO(), io.StringIO()
         app.configure_rar_backend(None)
-        review = app.Review(args, rows, errors, args.runtime)
+        review = app.Review(args, rows, errors, args.runtime, io.StringIO())
         review.scan(self.inputs)
         records = [json.loads(line) for line in rows.getvalue().splitlines()]
         self.assertEqual(list(args.runtime.iterdir()), [])
         return records, review
+
+    def files(self, review):
+        return [json.loads(line) for line in review.pdfs.getvalue().splitlines()]
+
+    def test_readiness_is_independent_of_classification_threshold(self):
+        with fitz.open() as doc:
+            doc.new_page().insert_text((30, 40), "Hi")
+            doc.new_page()
+            (self.inputs / "short.pdf").write_bytes(doc.tobytes())
+        with fitz.open() as doc:
+            doc.new_page()
+            (self.inputs / "blank.pdf").write_bytes(doc.tobytes())
+        rows, review = self.scan()
+        files = {r["file_name"]: r for r in self.files(review)}
+        self.assertEqual(files["short.pdf"]["readiness"], "READY_WITH_TEXT")
+        self.assertEqual(files["short.pdf"]["pages_with_text"], 1)
+        self.assertEqual(files["short.pdf"]["pages_without_text"], 1)
+        self.assertEqual(files["blank.pdf"]["readiness"], "READY_NO_TEXT_LAYER")
+        self.assertTrue(all(r["class"] == "other" for r in rows))
+        self.assertEqual(sum(r["has_extractable_text"] for r in rows), 1)
+        self.assertEqual(review.stats["errors"], 0)
+
+    def test_text_failure_is_partial_not_unreadable(self):
+        (self.inputs / "two.pdf").write_bytes(sample_pdf(2))
+        original = app.page_text_metrics
+
+        def extract(page):
+            if page.number == 0:
+                raise ValueError("synthetic text failure")
+            return original(page)
+
+        with mock.patch.object(app, "page_text_metrics", side_effect=extract):
+            rows, review = self.scan()
+        file = self.files(review)[0]
+        self.assertEqual(file["readiness"], "READY_TEXT_PARTIAL")
+        self.assertTrue(file["readable"])
+        self.assertFalse(file["text_ready"])
+        self.assertEqual(file["text_extraction_errors"], 1)
+        self.assertEqual(rows[0]["error_stage"], "text_extraction")
+        self.assertTrue(rows[0]["page_read_ok"])
+        self.assertFalse(rows[0]["text_extract_ok"])
+        self.assertIsNone(rows[0].get("has_extractable_text"))
+        self.assertEqual(rows[1]["class"], "digital")
+
+    def test_page_read_failure_does_not_mark_whole_pdf_readable(self):
+        (self.inputs / "two.pdf").write_bytes(sample_pdf(2))
+        original = fitz.Document.load_page
+
+        def load(doc, index):
+            if index == 0:
+                raise ValueError("synthetic page read failure")
+            return original(doc, index)
+
+        with mock.patch.object(fitz.Document, "load_page", load):
+            rows, review = self.scan()
+        file = self.files(review)[0]
+        self.assertEqual(file["readiness"], "PDF_NOT_READY")
+        self.assertEqual(file["pages_read"], 1)
+        self.assertEqual(file["page_read_errors"], 1)
+        self.assertEqual(rows[0]["error_stage"], "page_read")
+        self.assertFalse(rows[0]["page_read_ok"])
+        self.assertEqual(rows[1]["class"], "digital")
+
+    def test_classification_failure_preserves_text_readiness(self):
+        (self.inputs / "one.pdf").write_bytes(sample_pdf())
+        with mock.patch.object(app, "classify_page", side_effect=ValueError("drawing failure")):
+            rows, review = self.scan()
+        self.assertEqual(rows[0]["error_stage"], "classification")
+        self.assertTrue(rows[0]["has_extractable_text"])
+        self.assertGreater(rows[0]["text_chars"], 40)
+        file = self.files(review)[0]
+        self.assertEqual(file["readiness"], "READY_WITH_TEXT")
+        self.assertEqual(file["classification_errors"], 1)
+        self.assertEqual(review.stats["errors"], 1)
+
+    def test_empty_password_and_required_password_are_distinct(self):
+        with fitz.open(stream=sample_pdf(), filetype="pdf") as doc:
+            for name, password in (("empty.pdf", ""), ("locked.pdf", "secret")):
+                (self.inputs / name).write_bytes(
+                    doc.tobytes(
+                        encryption=fitz.PDF_ENCRYPT_AES_256, user_pw=password, owner_pw="owner"
+                    )
+                )
+        rows, review = self.scan()
+        files = {r["file_name"]: r for r in self.files(review)}
+        self.assertTrue(files["empty.pdf"]["encrypted"])
+        self.assertFalse(files["empty.pdf"]["password_required"])
+        self.assertEqual(files["empty.pdf"]["readiness"], "READY_WITH_TEXT")
+        self.assertTrue(files["locked.pdf"]["password_required"])
+        self.assertIn("requires a password", files["locked.pdf"]["file_error"])
+        self.assertEqual(files["locked.pdf"]["readiness"], "PDF_NOT_READY")
+
+    def test_pdf_limits_keep_one_overview_row(self):
+        (self.inputs / "large.pdf").write_bytes(sample_pdf(2))
+        for settings in ({"max_pages": 1}, {"max_pdf_gib": 1 / 1024**3}):
+            rows, review = self.scan(**settings)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(len(self.files(review)), 1)
+            self.assertEqual(self.files(review)[0]["readiness"], "PDF_NOT_READY")
+            self.assertEqual(review.stats["errors"], 1)
+
+    def test_nonfatal_parser_warnings_are_isolated(self):
+        (self.inputs / "a.pdf").write_bytes(sample_pdf())
+        (self.inputs / "b.pdf").write_bytes(sample_pdf())
+        old_errors = fitz.TOOLS.mupdf_display_errors()
+        with mock.patch.object(fitz.TOOLS, "mupdf_warnings", side_effect=["parser warning", ""]):
+            rows, review = self.scan()
+        files = self.files(review)
+        self.assertEqual([r["parser_warning_count"] for r in files], [1, 0])
+        self.assertEqual(review.stats["errors"], 0)
+        self.assertEqual(review.stats["parser_warnings"], 1)
+        self.assertTrue(all(r["readable"] for r in files))
+        self.assertEqual(fitz.TOOLS.mupdf_display_errors(), old_errors)
+
+    def test_missing_eof_is_information_not_a_readiness_failure(self):
+        (self.inputs / "tail.pdf").write_bytes(sample_pdf().replace(b"%%EOF", b"     "))
+        rows, review = self.scan()
+        file = self.files(review)[0]
+        self.assertTrue(file["header_present"])
+        self.assertFalse(file["eof_present"])
+        self.assertTrue(file["readable"])
+        self.assertEqual(review.stats["errors"], 0)
+
+    def test_real_parser_repair_and_clean_following_pdf(self):
+        data = sample_pdf()
+        data = data[: data.rfind(b"startxref")] + b"startxref\n0\n%%EOF\n"
+        (self.inputs / "a-repaired.pdf").write_bytes(data)
+        (self.inputs / "b-clean.pdf").write_bytes(sample_pdf())
+        rows, review = self.scan()
+        files = self.files(review)
+        self.assertTrue(files[0]["parser_repaired"])
+        self.assertGreater(files[0]["parser_warning_count"], 0)
+        self.assertFalse(files[1]["parser_repaired"])
+        self.assertEqual(files[1]["parser_warning_count"], 0)
+        self.assertTrue(all(r["readable"] for r in files))
+        self.assertEqual(review.stats["errors"], 0)
+
+    def test_real_selected_pdf_crc_failure_does_not_skip_other_members(self):
+        payload = sample_pdf()
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr("broken.pdf", payload)
+            archive.writestr("good.pdf", payload)
+        data = bytearray(stream.getvalue())
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            info = archive.infolist()[0]
+            offset = info.header_offset + 30 + len(info.filename.encode("utf-8"))
+        data[offset] ^= 1
+        (self.inputs / "one.zip").write_bytes(data)
+        rows, review = self.scan(check_zip_crc=True)
+        self.assertEqual(review.stats["pdfs_found"], 2)
+        self.assertEqual(len(self.files(review)), 2)
+        self.assertEqual(review.stats["errors"], 1)
+        self.assertEqual(
+            [r["readiness"] for r in self.files(review)], ["PDF_NOT_READY", "READY_WITH_TEXT"]
+        )
+        self.assertEqual(review.stats["zips_full_crc_failed"], 1)
+        self.assertEqual(review.stats["zip_members_crc_checked"], 1)
+
+    def test_full_zip_crc_checks_skipped_files_without_creating_pdf_errors(self):
+        payload = b"ordinary skipped member"
+        data = legacy_zip("folder/note.txt", payload, "cp437")
+        offset = 30 + len("folder/note.txt")
+        data = data[:offset] + bytes([data[offset] ^ 1]) + data[offset + 1 :]
+        (self.inputs / "bad-crc.zip").write_bytes(data)
+        rows, review = self.scan()
+        self.assertEqual(rows, [])
+        self.assertEqual(review.stats["errors"], 0)
+        rows, review = self.scan(check_zip_crc=True)
+        self.assertEqual(review.stats["errors"], 1)
+        self.assertEqual(review.stats["pdfs_found"], 0)
+        self.assertEqual(self.files(review), [])
+        self.assertEqual(rows[0]["object_type"], "file")
+        self.assertEqual(rows[0]["levels"], ["bad-crc.zip", "folder", "note.txt"])
+        self.assertEqual(review.stats["zips_full_crc_failed"], 1)
+
+    def test_full_zip_crc_reconciles_non_pdf_archives(self):
+        (self.inputs / "one.zip").write_bytes(zip_bytes([("leaf.pdf", sample_pdf())]))
+        (self.inputs / "two.zip").write_bytes(zip_bytes([("note.txt", b"skip")]))
+        (self.inputs / "three.zip").write_bytes(zip_bytes([]))
+        rows, review = self.scan(check_zip_crc=True)
+        self.assertEqual(review.stats["zips_opened"], 3)
+        self.assertEqual(review.stats["zips_with_direct_pdf"], 1)
+        self.assertEqual(review.stats["zips_without_direct_pdf"], 2)
+        self.assertEqual(review.stats["zips_full_crc_passed"], 3)
+        self.assertEqual(review.stats["zip_members_crc_checked"], 2)
+        self.assertEqual(review.stats["skipped_files"], 1)
+        self.assertEqual(review.stats["errors"], 0)
+
+    def test_pdf_member_read_failure_is_in_file_overview(self):
+        (self.inputs / "one.zip").write_bytes(zip_bytes([("leaf.pdf", sample_pdf())]))
+        with mock.patch.object(app.Review, "copy_member", side_effect=ValueError("CRC error")):
+            rows, review = self.scan(check_zip_crc=True)
+        self.assertEqual(len(self.files(review)), 1)
+        self.assertEqual(review.stats["pdfs_found"], 1)
+        self.assertEqual(self.files(review)[0]["readiness"], "PDF_NOT_READY")
+        self.assertEqual(review.stats["zips_full_crc_failed"], 1)
+
+    def test_nonfinite_limits_are_rejected(self):
+        for option in ("--max-pdf-gib", "--max-extracted-gib"):
+            for value in ("nan", "inf", "0", "-1"):
+                with (
+                    mock.patch.object(app, "PROJECT_DIR", self.root),
+                    self.assertRaises(ValueError),
+                ):
+                    app.run(["--root", str(self.inputs), option, value])
+
+    def test_timestamp_output_and_both_sheets_are_verified(self):
+        (self.inputs / "one.pdf").write_bytes(sample_pdf(2))
+        output = self.root / "review.xlsx"
+        with mock.patch.object(app, "PROJECT_DIR", self.root), redirect_stdout(io.StringIO()):
+            for _ in range(2):
+                self.assertEqual(
+                    app.run(
+                        ["--root", str(self.inputs), "--output", str(output), "--timestamp-output"]
+                    ),
+                    0,
+                )
+        outputs = list(self.root.glob("review-*.xlsx"))
+        self.assertEqual(len(outputs), 2)
+        for output in outputs:
+            workbook = load_workbook(output)
+            try:
+                self.assertEqual(workbook.sheetnames, ["pdf_pages", "pdf_files"])
+                file = workbook["pdf_files"]
+                self.assertEqual(file["B2"].value, "Table: PDF file readiness")
+                self.assertEqual(file.max_row, 7)
+                self.assertEqual(file["C6"].fill.fgColor.rgb, "FF00B0F0")
+                summary = json.loads(output.with_name(output.stem + "-summary.json").read_text())
+                self.assertEqual(summary["pdf_file_rows"], 1)
+                self.assertEqual(summary["pages_with_text"], 2)
+                self.assertEqual(summary["readiness"], {"READY_WITH_TEXT": 1})
+            finally:
+                workbook.close()
 
     def test_loose_case_insensitive_and_skips(self):
         (self.inputs / "document.PdF").write_bytes(sample_pdf(2))
@@ -224,7 +458,16 @@ class ReviewTests(unittest.TestCase):
             "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8"
         )
         output = self.root / "review.xlsx"
-        app.build_xlsx(spool, output, len(rows), review.stats["max_level"])
+        pdf_spool = self.root / "pdfs.jsonl"
+        pdf_spool.write_text(review.pdfs.getvalue(), encoding="utf-8")
+        app.build_xlsx(
+            spool,
+            output,
+            len(rows),
+            review.stats["max_level"],
+            pdf_spool,
+            review.stats["pdf_file_rows"],
+        )
         workbook = load_workbook(output)
         try:
             sheet = workbook["pdf_pages"]
@@ -243,6 +486,19 @@ class ReviewTests(unittest.TestCase):
             self.assertIn("=SUM(1,2).pdf", values)
             self.assertFalse(
                 any(c.data_type == "f" for row in sheet.iter_rows(min_row=7) for c in row[2:])
+            )
+            file_sheet = workbook["pdf_files"]
+            self.assertIn(
+                name.split("/")[-1],
+                {
+                    c.value
+                    for row in file_sheet.iter_rows(min_row=7)
+                    for c in row
+                    if c.data_type == "s"
+                },
+            )
+            self.assertFalse(
+                any(c.data_type == "f" for row in file_sheet.iter_rows(min_row=7) for c in row[2:])
             )
         finally:
             workbook.close()

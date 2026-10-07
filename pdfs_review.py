@@ -19,6 +19,8 @@ import time
 import zipfile
 import zlib
 from collections import Counter
+from datetime import datetime
+from math import isfinite
 from pathlib import Path
 
 import fitz
@@ -58,8 +60,54 @@ BASE_RESULT_COLUMNS = [
     "text_chars",
     "img_cover",
     "vector_count",
+    "page_read_ok",
+    "text_extract_ok",
+    "has_extractable_text",
+    "error_stage",
     "page_error",
 ]
+PDF_RESULT_COLUMNS = [
+    "pdf_id",
+    "leaf_level",
+    "full_path",
+    "file_name",
+    "file_size_bytes",
+    "in_archive",
+    "archive_depth",
+    "pdf_page_count",
+    "readiness",
+    "readable",
+    "text_ready",
+    "pages_read",
+    "pages_with_text",
+    "pages_without_text",
+    "page_read_errors",
+    "text_extraction_errors",
+    "classification_errors",
+    "encrypted",
+    "password_required",
+    "parser_repaired",
+    "parser_warning_count",
+    "parser_warnings",
+    "header_present",
+    "eof_present",
+    "file_error",
+]
+
+
+def page_text_metrics(page: fitz.Page) -> tuple[int, bool]:
+    """Extract once: classification counts characters; readiness requires non-whitespace."""
+    flags = fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
+    blocks = page.get_text("dict", flags=flags)["blocks"]
+    text_chars, meaningful = 0, False
+    for block in blocks:
+        if block.get("type") == 0:
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text = span.get("text", "")
+                    text_chars += len(text)
+                    meaningful = meaningful or bool(text.strip())
+    return text_chars, meaningful
 
 
 def _union_area(rects: list[tuple[float, float, float, float]]) -> float:
@@ -97,18 +145,12 @@ def classify_page(
     img_cover_threshold: float,
     min_img_frac: float,
     vector_threshold: int,
+    text_chars: int | None = None,
 ) -> tuple[str, int, float, int]:
-    flags = fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
-    blocks = page.get_text("dict", flags=flags)["blocks"]
+    if text_chars is None:
+        text_chars, _ = page_text_metrics(page)
     page_rect = page.rect
     page_area = max(1.0, page_rect.width * page_rect.height)
-
-    text_chars = 0
-    for block in blocks:
-        if block.get("type") == 0:
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    text_chars += len(span.get("text", ""))
 
     image_rects: list[tuple[float, float, float, float]] = []
     for image_info in page.get_image_info():
@@ -170,10 +212,13 @@ def build_xlsx(
     output_path: Path,
     row_count: int,
     max_level: int,
+    pdfs_path: Path | None = None,
+    pdf_count: int = 0,
 ) -> None:
-    if row_count > EXCEL_MAX_DATA_ROWS:
+    if max(row_count, pdf_count) > EXCEL_MAX_DATA_ROWS:
         raise RuntimeError(
-            f"{row_count:,} page rows exceed the one-sheet Excel limit of {EXCEL_MAX_DATA_ROWS:,}"
+            f"Worksheet data exceeds the Excel limit of {EXCEL_MAX_DATA_ROWS:,} rows "
+            f"(pdf_pages={row_count:,}, pdf_files={pdf_count:,})"
         )
 
     workbook = Workbook(write_only=True)
@@ -183,7 +228,40 @@ def build_xlsx(
     workbook.views[0].windowHeight = 12650
     workbook.views[0].tabRatio = 928
 
-    ws = workbook.create_sheet("pdf_pages")
+    add_flat_sheet(
+        workbook,
+        jsonl_path,
+        row_count,
+        max_level,
+        BASE_RESULT_COLUMNS,
+        "pdf_pages",
+        "Table: PDF page review",
+    )
+    if pdfs_path is not None:
+        add_flat_sheet(
+            workbook,
+            pdfs_path,
+            pdf_count,
+            max_level,
+            PDF_RESULT_COLUMNS,
+            "pdf_files",
+            "Table: PDF file readiness",
+        )
+    os.makedirs(fs_path(output_path.parent), exist_ok=True)
+    descriptor, temporary_output = tempfile.mkstemp(
+        prefix="pdfs-", suffix=".xlsx", dir=fs_path(output_path.parent)
+    )
+    os.close(descriptor)
+    try:
+        workbook.save(temporary_output)
+        os.replace(temporary_output, fs_path(output_path))
+    finally:
+        if os.path.exists(temporary_output):
+            os.unlink(temporary_output)
+
+
+def add_flat_sheet(workbook, jsonl_path, row_count, max_level, columns, sheet_name, title):
+    ws = workbook.create_sheet(sheet_name)
     ws.sheet_view.showGridLines = False
     ws.sheet_view.zoomScale = 85
     ws.sheet_view.zoomScaleNormal = 85
@@ -201,7 +279,7 @@ def build_xlsx(
     ws.page_margins.footer = 0.3
 
     level_columns = [f"level_{index}" for index in range(1, max_level + 1)]
-    result_columns = [*level_columns, *BASE_RESULT_COLUMNS]
+    result_columns = [*level_columns, *columns]
     headers = ["№пп", *result_columns, "last"]
     last_column = FIRST_TABLE_COLUMN + len(headers) - 1
     ws.column_dimensions["A"].width = NARROW_WIDTH
@@ -213,6 +291,9 @@ def build_xlsx(
             "full_path": 55,
             "file_name": 24,
             "page_error": 24,
+            "file_error": 24,
+            "parser_warnings": 24,
+            "readiness": 27,
         }
         ws.column_dimensions[letter].width = (
             NARROW_WIDTH if is_boundary else wide_columns.get(header, DATA_WIDTH)
@@ -237,7 +318,7 @@ def build_xlsx(
             None,
             styled_cell(
                 ws,
-                "Table: PDF page review",
+                title,
                 font=title_font,
             ),
         ]
@@ -307,7 +388,7 @@ def build_xlsx(
                         border=border,
                     )
                 )
-            for name in BASE_RESULT_COLUMNS:
+            for name in columns:
                 alignment = centered if name in centered_names else None
                 number_format = "0.0000" if name == "img_cover" else None
                 excel_row.append(
@@ -339,18 +420,6 @@ def build_xlsx(
     )
     ws.sheet_view.selection[0].activeCell = "B6"
     ws.sheet_view.selection[0].sqref = "B6"
-
-    os.makedirs(fs_path(output_path.parent), exist_ok=True)
-    descriptor, temporary_output = tempfile.mkstemp(
-        prefix="pdfs-", suffix=".xlsx", dir=fs_path(output_path.parent)
-    )
-    os.close(descriptor)
-    try:
-        workbook.save(temporary_output)
-        os.replace(temporary_output, fs_path(output_path))
-    finally:
-        if os.path.exists(temporary_output):
-            os.unlink(temporary_output)
 
 
 # Filesystem and archive names
@@ -397,10 +466,12 @@ def configure_rar_backend(explicit: str | None) -> None:
 
 
 class Review:
-    def __init__(self, args, rows, errors, temp_root: Path):
+    def __init__(self, args, rows, errors, temp_root: Path, pdfs=None):
         self.args, self.rows, self.errors, self.temp_root = args, rows, errors, temp_root
+        self.pdfs = pdfs
         self.stats = Counter()
         self.classes = Counter()
+        self.readiness = Counter()
         self.last_progress = time.monotonic()
 
     def progress(self):
@@ -427,7 +498,17 @@ class Review:
             "pdf_page_count": None,
         }
 
-    def emit(self, base, page=None, klass="error", text=None, cover=None, vectors=None, error=""):
+    def emit(
+        self,
+        base,
+        page=None,
+        klass="error",
+        text=None,
+        cover=None,
+        vectors=None,
+        error="",
+        **checks,
+    ):
         self.rows.write(
             json.dumps(
                 {
@@ -438,6 +519,7 @@ class Review:
                     "img_cover": cover,
                     "vector_count": vectors,
                     "page_error": error,
+                    **checks,
                 },
                 ensure_ascii=False,
             )
@@ -450,7 +532,8 @@ class Review:
             self.classes[klass] += 1
         self.progress()
 
-    def failure(self, base, exc, page=None):
+    def failure(self, base, exc, page=None, **checks):
+        new_pdf = base["object_type"] == "pdf" and base["pdf_id"] is None
         if base["object_type"] == "pdf" and base["pdf_id"] is None:
             self.stats["pdfs_found"] += 1
             base["pdf_id"] = self.stats["pdfs_found"]
@@ -458,7 +541,37 @@ class Review:
         self.stats["errors"] += 1
         self.errors.write(f"{base['full_path']}\t{page or ''}\t{message}\n")
         self.errors.flush()
-        self.emit(base, page=page, error=message)
+        self.emit(base, page=page, error=message, **checks)
+        if new_pdf:
+            self.finish_pdf({**base, "file_error": message})
+        return message
+
+    def finish_pdf(self, record):
+        total = record.get("pdf_page_count")
+        readable = bool(
+            total and record.get("pages_read") == total and not record.get("file_error")
+        )
+        text_ok = readable and not record.get("text_extraction_errors")
+        if not readable:
+            readiness = "PDF_NOT_READY"
+        elif not text_ok:
+            readiness = "READY_TEXT_PARTIAL"
+        elif record.get("pages_with_text", 0):
+            readiness = "READY_WITH_TEXT"
+        else:
+            readiness = "READY_NO_TEXT_LAYER"
+        record.update(
+            readiness=readiness,
+            readable=readable,
+            text_ready=bool(text_ok and record.get("pages_with_text", 0)),
+        )
+        if self.pdfs is not None:
+            self.pdfs.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.readiness[readiness] += 1
+        self.stats["pdf_file_rows"] += 1
+        self.stats["pdfs_readable"] += int(readable)
+        self.stats["pdfs_text_ready"] += int(record["text_ready"])
+        self.stats["parser_warnings"] += record.get("parser_warning_count", 0)
 
     def check_size(self, size):
         if size > MAX_MEMBER_BYTES:
@@ -487,32 +600,110 @@ class Review:
         self.stats["pdfs_found"] += 1
         base = self.base(logical, levels, depth)
         base["pdf_id"] = self.stats["pdfs_found"]
+        record = {
+            **base,
+            "pages_read": 0,
+            "pages_with_text": 0,
+            "pages_without_text": 0,
+            "page_read_errors": 0,
+            "text_extraction_errors": 0,
+            "classification_errors": 0,
+            "file_error": "",
+        }
+        old_errors = fitz.TOOLS.mupdf_display_errors()
+        old_warnings = fitz.TOOLS.mupdf_display_warnings()
+        fitz.TOOLS.mupdf_display_errors(False)
+        fitz.TOOLS.mupdf_display_warnings(False)
+        fitz.TOOLS.reset_mupdf_warnings()
         try:
             base["file_size_bytes"] = os.stat(fs_path(path)).st_size
+            if base["file_size_bytes"] > self.args.max_pdf_gib * 1024**3:
+                raise ValueError("PDF exceeds the configured size limit")
+            with open(fs_path(path), "rb") as source:
+                record["header_present"] = b"%PDF-" in source.read(1024)
+                source.seek(max(0, base["file_size_bytes"] - 4096))
+                record["eof_present"] = b"%%EOF" in source.read()
             with fitz.open(fs_path(path), filetype="pdf") as doc:
                 if not doc.is_pdf:
                     raise ValueError("File is not a PDF")
-                if doc.needs_pass:
+                record["encrypted"] = bool(
+                    doc.is_encrypted or (doc.metadata or {}).get("encryption")
+                )
+                record["password_required"] = bool(doc.needs_pass and not doc.authenticate(""))
+                record["parser_repaired"] = bool(doc.is_repaired)
+                if record["password_required"]:
                     raise ValueError("PDF requires a password")
+                base["pdf_page_count"] = doc.page_count
                 if not doc.page_count:
                     raise ValueError("PDF has no pages")
-                base["pdf_page_count"] = doc.page_count
+                if doc.page_count > self.args.max_pages:
+                    raise ValueError("PDF exceeds the configured page limit")
                 self.stats["pdfs_opened"] += 1
                 for index in range(doc.page_count):
                     try:
+                        page = doc[index]
+                        if page.rect.is_empty or page.rect.is_infinite:
+                            raise ValueError("Page has invalid dimensions")
+                    except Exception as exc:
+                        record["page_read_errors"] += 1
+                        self.stats["page_read_errors"] += 1
+                        self.failure(
+                            base, exc, page=index + 1, error_stage="page_read", page_read_ok=False
+                        )
+                        continue
+                    record["pages_read"] += 1
+                    try:
+                        text_chars, meaningful = page_text_metrics(page)
+                    except Exception as exc:
+                        record["text_extraction_errors"] += 1
+                        self.stats["text_extraction_errors"] += 1
+                        self.failure(
+                            base,
+                            exc,
+                            page=index + 1,
+                            error_stage="text_extraction",
+                            page_read_ok=True,
+                            text_extract_ok=False,
+                        )
+                        continue
+                    key = "pages_with_text" if meaningful else "pages_without_text"
+                    record[key] += 1
+                    self.stats[key] += 1
+                    checks = dict(
+                        page_read_ok=True, text_extract_ok=True, has_extractable_text=meaningful
+                    )
+                    try:
                         result = classify_page(
-                            doc[index],
+                            page,
+                            text_chars=text_chars,
                             text_threshold=self.args.text_threshold,
                             img_cover_threshold=self.args.img_cover_threshold,
                             min_img_frac=self.args.min_img_frac,
                             vector_threshold=self.args.vector_threshold,
                         )
                     except Exception as exc:
-                        self.failure(base, exc, page=index + 1)
+                        record["classification_errors"] += 1
+                        self.stats["classification_errors"] += 1
+                        self.failure(
+                            base,
+                            exc,
+                            page=index + 1,
+                            error_stage="classification",
+                            text=text_chars,
+                            **checks,
+                        )
                     else:
-                        self.emit(base, index + 1, *result)
-        except (OSError, RuntimeError, ValueError) as exc:
-            self.failure(base, exc)
+                        self.emit(base, index + 1, *result, **checks)
+        except Exception as exc:
+            record["file_error"] = self.failure(base, exc, error_stage="pdf_open_or_limit")
+        finally:
+            diagnostics = fitz.TOOLS.mupdf_warnings()
+            fitz.TOOLS.mupdf_display_errors(old_errors)
+            fitz.TOOLS.mupdf_display_warnings(old_warnings)
+            record.update(base)
+            record["parser_warnings"] = diagnostics
+            record["parser_warning_count"] = len(diagnostics.splitlines())
+            self.finish_pdf(record)
 
     def member(self, source, info_size, name, logical, levels, depth, temporary):
         parts = tuple(part for part in name.replace("\\", "/").split("/") if part)
@@ -526,15 +717,30 @@ class Review:
             "archive" if suffix(name) in ARCHIVE_SUFFIXES else "pdf",
         )
         path = Path(temporary) / "member.bin"
+        copied = False
         try:
             self.copy_member(source, path, info_size)
         except Exception as exc:
             self.failure(base, exc)
         else:
+            copied = True
             self.visit(path, child_logical, child_levels, depth)
         finally:
             if os.path.exists(fs_path(path)):
                 os.unlink(fs_path(path))
+        return copied
+
+    def drain_member(self, source, expected):
+        """Consume to EOF for ZIP CRC validation without retaining unrelated files."""
+        self.check_size(expected)
+        written = 0
+        while chunk := source.read(1024 * 1024):
+            written += len(chunk)
+            if written > MAX_MEMBER_BYTES:
+                raise ValueError("Archive member exceeds the configured size limit")
+            self.consume(len(chunk))
+        if written != expected:
+            raise ValueError("Archive member size mismatch")
 
     def zip_or_rar(self, path, logical, levels, depth, temporary, kind):
         archive_class = zipfile.ZipFile if kind == ".zip" else rarfile.RarFile
@@ -542,6 +748,15 @@ class Review:
             infos = archive.infolist()
             if len(infos) > MAX_ARCHIVE_MEMBERS:
                 raise ValueError("Archive member count exceeds the configured limit")
+            full_crc = kind == ".zip" and self.args.check_zip_crc
+            crc_ok = True
+            if kind == ".zip":
+                self.stats["zips_opened"] += 1
+                has_pdf = any(
+                    not i.is_dir() and suffix(zip_name(i, self.args.zip_encoding)) == ".pdf"
+                    for i in infos
+                )
+                self.stats["zips_with_direct_pdf" if has_pdf else "zips_without_direct_pdf"] += 1
             for info in infos:
                 if info.is_dir():
                     continue
@@ -551,10 +766,12 @@ class Review:
                 name = zip_name(info, self.args.zip_encoding) if kind == ".zip" else info.filename
                 if not selected(name):
                     self.stats["skipped_files"] += 1
-                    continue
+                    if not full_crc:
+                        continue
                 try:
                     source = archive.open(info)
                 except Exception as exc:
+                    crc_ok = False
                     parts = tuple(p for p in name.replace("\\", "/").split("/") if p)
                     self.failure(
                         self.base(
@@ -562,13 +779,43 @@ class Review:
                             levels + parts,
                             depth,
                             info.file_size,
-                            "archive" if suffix(name) in ARCHIVE_SUFFIXES else "pdf",
+                            "archive"
+                            if suffix(name) in ARCHIVE_SUFFIXES
+                            else "pdf"
+                            if suffix(name) == ".pdf"
+                            else "file",
                         ),
                         exc,
                     )
                 else:
                     with source:
-                        self.member(source, info.file_size, name, logical, levels, depth, temporary)
+                        if selected(name):
+                            checked = self.member(
+                                source, info.file_size, name, logical, levels, depth, temporary
+                            )
+                        else:
+                            try:
+                                self.drain_member(source, info.file_size)
+                            except Exception as exc:
+                                parts = tuple(p for p in name.replace("\\", "/").split("/") if p)
+                                self.failure(
+                                    self.base(
+                                        logical + "::" + name,
+                                        levels + parts,
+                                        depth,
+                                        info.file_size,
+                                        "file",
+                                    ),
+                                    exc,
+                                )
+                                checked = False
+                            else:
+                                checked = True
+                        crc_ok = crc_ok and checked
+                        if kind == ".zip" and checked:
+                            self.stats["zip_members_crc_checked"] += 1
+            if full_crc:
+                self.stats["zips_full_crc_passed" if crc_ok else "zips_full_crc_failed"] += 1
 
     def seven_zip(self, path, logical, levels, depth, temporary):
         with py7zr.SevenZipFile(fs_path(path), mode="r") as archive:
@@ -613,6 +860,8 @@ class Review:
             self.pdf(path, logical, levels, depth)
         elif kind in ARCHIVE_SUFFIXES:
             self.stats["archives"] += 1
+            if kind == ".zip":
+                self.stats["zips_found"] += 1
             try:
                 if depth >= self.args.max_depth:
                     raise ValueError("Archive nesting limit reached")
@@ -724,6 +973,18 @@ def parse_args(argv=None):
     parser.add_argument("--seven-zip", help="Optional 7z executable path for RAR support")
     parser.add_argument("--max-depth", type=int, default=MAX_ARCHIVE_DEPTH)
     parser.add_argument("--max-extracted-gib", type=float, default=MAX_EXTRACTED_BYTES / 1024**3)
+    parser.add_argument("--max-pdf-gib", type=float, default=2)
+    parser.add_argument("--max-pages", type=int, default=10_000)
+    parser.add_argument(
+        "--check-zip-crc",
+        action="store_true",
+        help="Read and CRC-check every ZIP member, including skipped extensions",
+    )
+    parser.add_argument(
+        "--timestamp-output",
+        action="store_true",
+        help="Add a timestamp to the output name to retain previous workbooks",
+    )
     parser.add_argument("--text-threshold", type=int, default=40)
     parser.add_argument("--img-cover-threshold", type=float, default=0.90)
     parser.add_argument("--min-img-frac", type=float, default=0.005)
@@ -737,13 +998,17 @@ def run(argv=None):
         raise ValueError("Set ROOT_FOLDER in pdfs_review.py or pass --root")
     root = Path(os.path.abspath(args.root))
     args.output = Path(os.path.abspath(args.output))
+    if args.timestamp_output:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        args.output = args.output.with_name(f"{args.output.stem}-{stamp}{args.output.suffix}")
     args.runtime = PROJECT_DIR / ".runtime"
     if not os.path.isdir(fs_path(root)):
         raise ValueError("Input folder is unavailable")
     if args.output.suffix.casefold() != ".xlsx":
         raise ValueError("Output must end with .xlsx")
-    if args.max_depth < 1 or args.max_extracted_gib <= 0:
-        raise ValueError("Archive limits must be positive")
+    limits = (args.max_depth, args.max_extracted_gib, args.max_pdf_gib, args.max_pages)
+    if any(not isfinite(value) or value <= 0 for value in limits):
+        raise ValueError("Archive and PDF limits must be positive")
     if args.text_threshold < 0 or args.vector_threshold < 0:
         raise ValueError("Text and vector thresholds must be nonnegative")
     if not (0 <= args.img_cover_threshold <= 1 and 0 <= args.min_img_frac <= 1):
@@ -752,6 +1017,7 @@ def run(argv=None):
     configure_rar_backend(args.seven_zip)
     args.runtime.mkdir(exist_ok=True)
     spool = args.runtime / "pages.jsonl"
+    pdf_spool = args.runtime / "pdfs.jsonl"
     errors = args.output.with_name(args.output.stem + "-errors.txt")
     summary = args.output.with_name(args.output.stem + "-summary.json")
     os.makedirs(fs_path(args.output.parent), exist_ok=True)
@@ -760,18 +1026,28 @@ def run(argv=None):
     with tempfile.TemporaryDirectory(prefix="review-", dir=args.runtime) as temporary:
         with (
             spool.open("w", encoding="utf-8") as rows,
+            pdf_spool.open("w", encoding="utf-8") as pdfs,
             open(fs_path(errors), "w", encoding="utf-8") as log,
         ):
-            review = Review(args, rows, log, Path(temporary))
+            review = Review(args, rows, log, Path(temporary), pdfs)
             review.scan(root)
+        if review.stats["pdf_file_rows"] != review.stats["pdfs_found"]:
+            raise RuntimeError("PDF discovery/file overview count mismatch")
         print("Writing workbook...", flush=True)
-        build_xlsx(spool, args.output, review.stats["rows"], review.stats["max_level"])
+        build_xlsx(
+            spool,
+            args.output,
+            review.stats["rows"],
+            review.stats["max_level"],
+            pdf_spool,
+            review.stats["pdf_file_rows"],
+        )
     workbook = load_workbook(fs_path(args.output), read_only=True)
     try:
-        sheet = workbook["pdf_pages"]
-        written_rows = sum(1 for _ in sheet.iter_rows(min_row=7, values_only=True))
-        if written_rows != review.stats["rows"]:
-            raise RuntimeError("Workbook row count mismatch")
+        for name, key in (("pdf_pages", "rows"), ("pdf_files", "pdf_file_rows")):
+            written_rows = sum(1 for _ in workbook[name].iter_rows(min_row=7, values_only=True))
+            if written_rows != review.stats[key]:
+                raise RuntimeError(f"Workbook {name} row count mismatch")
     finally:
         workbook.close()
     keys = (
@@ -784,10 +1060,31 @@ def run(argv=None):
         "decompressed_bytes",
         "errors",
         "max_level",
+        "pdf_file_rows",
+        "pdfs_readable",
+        "pdfs_text_ready",
+        "pages_with_text",
+        "pages_without_text",
+        "page_read_errors",
+        "text_extraction_errors",
+        "classification_errors",
+        "parser_warnings",
+        "zips_opened",
+        "zips_with_direct_pdf",
+        "zips_found",
+        "zips_without_direct_pdf",
+        "zip_members_crc_checked",
+        "zips_full_crc_passed",
+        "zips_full_crc_failed",
     )
     result = {key: review.stats[key] for key in keys}
     result.update(
-        {"classes": dict(review.classes), "elapsed_seconds": round(time.monotonic() - started, 1)}
+        {
+            "classes": dict(review.classes),
+            "readiness": dict(review.readiness),
+            "zip_full_crc_requested": args.check_zip_crc,
+            "elapsed_seconds": round(time.monotonic() - started, 1),
+        }
     )
     with open(fs_path(summary), "w", encoding="utf-8") as handle:
         json.dump(result, handle, ensure_ascii=False, indent=2)
