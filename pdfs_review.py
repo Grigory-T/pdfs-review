@@ -11,6 +11,7 @@ import argparse
 import codecs
 import json
 import os
+import re
 import shutil
 import struct
 import sys
@@ -19,6 +20,7 @@ import time
 import zipfile
 import zlib
 from collections import Counter
+from contextlib import suppress
 from datetime import datetime
 from math import isfinite
 from pathlib import Path
@@ -30,6 +32,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Border, Color, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.writer.excel import ExcelWriter
 from py7zr.io import Py7zIO, WriterFactory
 
 # Configuration: edit this path for a routine run. CLI options override it.
@@ -41,6 +44,9 @@ MAX_ARCHIVE_MEMBERS = 100_000
 MAX_MEMBER_BYTES = 50 * 1024**3
 MAX_EXTRACTED_BYTES = 100 * 1024**3
 EXCEL_MAX_DATA_ROWS = 1_048_570
+EXCEL_MAX_TEXT_UNITS = 32_767
+EXCEL_MAX_LINE_FEEDS = 253
+INVALID_XML_TEXT = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 TITLE_ROW, COLUMN_NUMBER_ROW, HEADER_ROW, DATA_START_ROW = 2, 4, 6, 7
 FIRST_TABLE_COLUMN = 2
 NARROW_WIDTH, DATA_WIDTH = 5.81640625, 12.54296875
@@ -179,6 +185,90 @@ def classify_page(
     return klass, text_chars, round(image_cover, 4), vector_count
 
 
+def utf16_units(value: str) -> int:
+    return len(value.encode("utf-16-le", errors="surrogatepass")) // 2
+
+
+class ExcelText:
+    """Keep every original value; Excel gets a marked preview only when necessary."""
+
+    def __init__(self, handle, filename):
+        self.handle, self.filename = handle, filename
+        self.cells = 0
+        self.fields = Counter()
+        self.reasons = Counter()
+
+    def cell(self, value, *, sheet, row, column, record):
+        if not isinstance(value, str):
+            return value
+        reasons = []
+        if utf16_units(value) > EXCEL_MAX_TEXT_UNITS:
+            reasons.append("text_length")
+        if value.count("\n") > EXCEL_MAX_LINE_FEEDS:
+            reasons.append("line_feeds")
+        if INVALID_XML_TEXT.search(value):
+            reasons.append("xml_characters")
+        if not reasons:
+            return value
+        self.cells += 1
+        self.fields[f"{sheet}.{column}"] += 1
+        self.reasons.update(reasons)
+        # ASCII escapes make JSONL UTF-8-safe even for isolated Unicode surrogates.
+        self.handle.write(
+            json.dumps(
+                {
+                    "id": self.cells,
+                    "sheet": sheet,
+                    "excel_row": row,
+                    "column": column,
+                    "pdf_id": record.get("pdf_id"),
+                    "page_number": record.get("page_number"),
+                    "reasons": reasons,
+                    "utf16_units": utf16_units(value),
+                    "value": value,
+                },
+                ensure_ascii=True,
+            )
+            + "\n"
+        )
+        safe = INVALID_XML_TEXT.sub(lambda m: f"\\u{ord(m[0]):04X}", value)
+        safe = safe.replace("\n", "\\n").replace("\r", "\\r")
+        marker = f"[Excel-safe preview; full value: {self.filename} #{self.cells}; {', '.join(reasons)}]\n"
+        budget = EXCEL_MAX_TEXT_UNITS - utf16_units(marker)
+        preview = safe.encode("utf-16-le")[: budget * 2].decode("utf-16-le", errors="ignore")
+        return marker + preview
+
+    def summary(self):
+        return {
+            "excel_text_cells_adjusted": self.cells,
+            "excel_text_fields": dict(self.fields),
+            "excel_text_reasons": dict(self.reasons),
+            "cell_details_file": self.filename if self.cells else None,
+        }
+
+
+def close_write_only_workbook(workbook):
+    """Close XML streams before unlinking temp files, including on Windows.
+
+    The pinned openpyxl write-only API has no public discard operation. Its
+    worksheet writer cleanup is therefore used here and covered by failure tests.
+    Never replace the original export exception with a secondary cleanup error.
+    """
+    for sheet in workbook.worksheets:
+        writer = getattr(sheet, "_writer", None)
+        if writer is None:
+            continue
+        if not sheet.closed:
+            with suppress(Exception):
+                sheet.close()
+        with suppress(Exception):
+            writer.close()
+        if os.path.exists(writer.out):
+            with suppress(OSError):
+                writer.cleanup()
+    workbook.close()
+
+
 def styled_cell(
     ws,
     value: object,
@@ -190,10 +280,11 @@ def styled_cell(
     number_format: str | None = None,
     literal: bool = False,
 ) -> WriteOnlyCell:
+    if literal and isinstance(value, str):
+        if utf16_units(value) > EXCEL_MAX_TEXT_UNITS:
+            raise ValueError("Unprepared Excel text exceeds the cell limit")
     cell = WriteOnlyCell(ws, value=value)
     if literal and isinstance(value, str):
-        if len(value.encode("utf-16-le")) // 2 > 32767:
-            raise ValueError("Excel cell text exceeds 32767 characters")
         cell.data_type = "s"
     cell.font = font
     if border:
@@ -214,7 +305,7 @@ def build_xlsx(
     max_level: int,
     pdfs_path: Path | None = None,
     pdf_count: int = 0,
-) -> None:
+) -> dict:
     if max(row_count, pdf_count) > EXCEL_MAX_DATA_ROWS:
         raise RuntimeError(
             f"Worksheet data exceeds the Excel limit of {EXCEL_MAX_DATA_ROWS:,} rows "
@@ -228,39 +319,64 @@ def build_xlsx(
     workbook.views[0].windowHeight = 12650
     workbook.views[0].tabRatio = 928
 
-    add_flat_sheet(
-        workbook,
-        jsonl_path,
-        row_count,
-        max_level,
-        BASE_RESULT_COLUMNS,
-        "pdf_pages",
-        "Table: PDF page review",
-    )
-    if pdfs_path is not None:
-        add_flat_sheet(
-            workbook,
-            pdfs_path,
-            pdf_count,
-            max_level,
-            PDF_RESULT_COLUMNS,
-            "pdf_files",
-            "Table: PDF file readiness",
-        )
+    if (
+        FIRST_TABLE_COLUMN + max_level + max(len(BASE_RESULT_COLUMNS), len(PDF_RESULT_COLUMNS)) + 1
+        > 16384
+    ):
+        raise ValueError("Hierarchy exceeds the Excel column limit")
     os.makedirs(fs_path(output_path.parent), exist_ok=True)
     descriptor, temporary_output = tempfile.mkstemp(
         prefix="pdfs-", suffix=".xlsx", dir=fs_path(output_path.parent)
     )
     os.close(descriptor)
+    details_path = None
+    published = False
     try:
-        workbook.save(temporary_output)
+        descriptor, details_path = tempfile.mkstemp(
+            prefix="pdfs-cell-details-", suffix=".jsonl", dir=fs_path(output_path.parent)
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as details:
+            text_export = ExcelText(details, Path(details_path).name)
+            add_flat_sheet(
+                workbook,
+                jsonl_path,
+                row_count,
+                max_level,
+                BASE_RESULT_COLUMNS,
+                "pdf_pages",
+                "Table: PDF page review",
+                text_export,
+            )
+            if pdfs_path is not None:
+                add_flat_sheet(
+                    workbook,
+                    pdfs_path,
+                    pdf_count,
+                    max_level,
+                    PDF_RESULT_COLUMNS,
+                    "pdf_files",
+                    "Table: PDF file readiness",
+                    text_export,
+                )
+        # Explicit ZIP context also closes the XLSX archive if serialization fails.
+        with zipfile.ZipFile(
+            temporary_output, "w", zipfile.ZIP_DEFLATED, allowZip64=True
+        ) as archive:
+            ExcelWriter(workbook, archive).save()
         os.replace(temporary_output, fs_path(output_path))
+        published = True
+        return text_export.summary()
     finally:
+        close_write_only_workbook(workbook)
         if os.path.exists(temporary_output):
             os.unlink(temporary_output)
+        if details_path and (not published or not text_export.cells):
+            os.unlink(details_path)
 
 
-def add_flat_sheet(workbook, jsonl_path, row_count, max_level, columns, sheet_name, title):
+def add_flat_sheet(
+    workbook, jsonl_path, row_count, max_level, columns, sheet_name, title, text_export
+):
     ws = workbook.create_sheet(sheet_name)
     ws.sheet_view.showGridLines = False
     ws.sheet_view.zoomScale = 85
@@ -368,6 +484,12 @@ def add_flat_sheet(workbook, jsonl_path, row_count, max_level, columns, sheet_na
         for row_number, line in enumerate(handle, start=1):
             record = json.loads(line)
             levels = record.get("levels", [])
+
+            def excel_value(value, name):
+                return text_export.cell(
+                    value, sheet=sheet_name, row=row_number + HEADER_ROW, column=name, record=record
+                )
+
             excel_row: list[object] = [None]
             excel_row.append(
                 styled_cell(
@@ -382,7 +504,10 @@ def add_flat_sheet(workbook, jsonl_path, row_count, max_level, columns, sheet_na
                 excel_row.append(
                     styled_cell(
                         ws,
-                        levels[level_index] if level_index < len(levels) else None,
+                        excel_value(
+                            levels[level_index] if level_index < len(levels) else None,
+                            f"level_{level_index + 1}",
+                        ),
                         literal=True,
                         font=normal_font,
                         border=border,
@@ -394,7 +519,7 @@ def add_flat_sheet(workbook, jsonl_path, row_count, max_level, columns, sheet_na
                 excel_row.append(
                     styled_cell(
                         ws,
-                        record.get(name),
+                        excel_value(record.get(name), name),
                         literal=True,
                         font=normal_font,
                         border=border,
@@ -521,7 +646,7 @@ class Review:
                     "page_error": error,
                     **checks,
                 },
-                ensure_ascii=False,
+                ensure_ascii=True,
             )
             + "\n"
         )
@@ -566,7 +691,7 @@ class Review:
             text_ready=bool(text_ok and record.get("pages_with_text", 0)),
         )
         if self.pdfs is not None:
-            self.pdfs.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self.pdfs.write(json.dumps(record, ensure_ascii=True) + "\n")
         self.readiness[readiness] += 1
         self.stats["pdf_file_rows"] += 1
         self.stats["pdfs_readable"] += int(readable)
@@ -1006,6 +1131,14 @@ def run(argv=None):
         raise ValueError("Input folder is unavailable")
     if args.output.suffix.casefold() != ".xlsx":
         raise ValueError("Output must end with .xlsx")
+    if os.path.exists(fs_path(args.output)):
+        try:
+            with open(fs_path(args.output), "rb+"):
+                pass
+        except PermissionError as exc:
+            raise PermissionError(
+                "Output is locked or read-only. Close Excel or use --timestamp-output"
+            ) from exc
     limits = (args.max_depth, args.max_extracted_gib, args.max_pdf_gib, args.max_pages)
     if any(not isfinite(value) or value <= 0 for value in limits):
         raise ValueError("Archive and PDF limits must be positive")
@@ -1027,14 +1160,14 @@ def run(argv=None):
         with (
             spool.open("w", encoding="utf-8") as rows,
             pdf_spool.open("w", encoding="utf-8") as pdfs,
-            open(fs_path(errors), "w", encoding="utf-8") as log,
+            open(fs_path(errors), "w", encoding="utf-8", errors="backslashreplace") as log,
         ):
             review = Review(args, rows, log, Path(temporary), pdfs)
             review.scan(root)
         if review.stats["pdf_file_rows"] != review.stats["pdfs_found"]:
             raise RuntimeError("PDF discovery/file overview count mismatch")
         print("Writing workbook...", flush=True)
-        build_xlsx(
+        export_result = build_xlsx(
             spool,
             args.output,
             review.stats["rows"],
@@ -1084,11 +1217,34 @@ def run(argv=None):
             "readiness": dict(review.readiness),
             "zip_full_crc_requested": args.check_zip_crc,
             "elapsed_seconds": round(time.monotonic() - started, 1),
+            "settings": {
+                name: getattr(args, name)
+                for name in (
+                    "zip_encoding",
+                    "check_zip_crc",
+                    "max_depth",
+                    "max_extracted_gib",
+                    "max_pdf_gib",
+                    "max_pages",
+                    "text_threshold",
+                    "img_cover_threshold",
+                    "min_img_frac",
+                    "vector_threshold",
+                )
+            },
+            "pymupdf_version": fitz.VersionBind,
+            **export_result,
         }
     )
     with open(fs_path(summary), "w", encoding="utf-8") as handle:
         json.dump(result, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
+    if export_result["excel_text_cells_adjusted"]:
+        print(
+            f"WARNING: {export_result['excel_text_cells_adjusted']:,} cells use Excel-safe previews. "
+            f"Full original values: {args.output.parent / export_result['cell_details_file']}",
+            flush=True,
+        )
     print(
         f"Done: {result['pdfs_found']:,} PDFs; {result['pages']:,} pages; "
         f"{result['skipped_files']:,} skipped files; {result['errors']:,} errors.\n"

@@ -35,11 +35,14 @@ Results beside the script:
 - `pdfs-review.xlsx`: `pdf_pages` (page detail) and `pdf_files` (one row per PDF occurrence).
 - `pdfs-review-summary.json`: counts, class/readiness totals and elapsed time.
 - `pdfs-review-errors.txt`: paths and reasons for actual failures.
+- `pdfs-cell-details-<unique>.jsonl`: created only when cells need Excel-safe
+  previews; retains complete original values and their sheet/row/field locations.
 
 Use `--output` to change the result location, or `--timestamp-output` to preserve
 earlier workbooks without replacing a file open in Excel. Exit codes: `0` for a completed run
 without errors, `2` for a saved workbook with failures, `1` for a fatal failure,
 and `130` for interruption. Non-PDF files and archives with no PDFs are not errors.
+Excel-safe previews are reported as export warnings, not PDF failures.
 
 ## Table
 
@@ -121,8 +124,12 @@ thresholds for task-specific adaptation.
   names use the ZIP standard CP437. Specify `--zip-encoding cp866` or `cp1251` when
   the source archive uses a different unmarked encoding; it cannot be inferred reliably.
 - Excel stores names as literal Unicode strings, including names starting with `=`.
-  Names are not normalized or shortened. A value exceeding Excel's cell limit fails
-  explicitly rather than silently truncating it.
+  Ordinary names are not normalized or shortened. Oversized strings, excessive
+  line feeds and XML-forbidden characters get explicitly marked Excel-safe
+  previews. Complete original values are saved losslessly in a uniquely named
+  JSONL sidecar beside the workbook, linked by an ID in each affected cell.
+  Limits are 32,767 UTF-16 units and 253 line feeds per cell. A sidecar write
+  failure remains fatal: the tool never silently discards the original value.
 - Processing is sequential. PDF rows are spooled to local disk and Excel is written
   incrementally. A solid 7z archive is decoded once; selected members remain in
   temporary storage until that archive is processed. Solid RAR member reads can be slower.
@@ -136,7 +143,15 @@ thresholds for task-specific adaptation.
   `--max-pages` override these run limits. Limit failures are reported. PDF size
   is checked before parsing, after an archive member has been captured to disk.
 - Temporary files are removed after processing. The workbook is replaced atomically
-  after a successful write. Close it in Excel before rerunning. Each run starts fresh.
+  after a successful write. Worksheet XML streams are closed before cleanup even
+  if export fails. A locked/read-only existing workbook is checked before scanning;
+  close it in Excel or use `--timestamp-output`. A late write failure leaves the
+  previous workbook intact. Each run starts fresh.
+
+The summary also records effective parsing settings, the PyMuPDF version,
+`excel_text_cells_adjusted`, affected fields/reasons and `cell_details_file`.
+Keep any JSONL sidecar together with its workbook; it can contain sensitive paths
+and parser messages. It is not an input dataset or an additional PDF analysis.
 
 ## Adaptation and development
 
