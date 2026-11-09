@@ -47,6 +47,26 @@ count. No extracted text or document metadata content is written to the workbook
 Paths and parser/error messages can contain sensitive source information: keep
 generated workbooks and logs local to the machine processing the input.
 
+### Interpreting recoverable parser diagnostics
+
+`parser_warnings` in the summary counts diagnostic lines, not distinct defects or
+affected PDFs. Repeated messages can include a `format error` prefix even when
+MuPDF recovers and no Python processing call fails. `errors` counts actual review
+failures; it is not a count of all diagnostics containing the word "error".
+
+Out-of-range object references indicate malformed references into a PDF's object
+table. Bad parent links in the tagged structure tree indicate broken logical
+structure metadata; MuPDF can ignore that structure and continue page operations.
+See the upstream [object-reference checks](https://github.com/ArtifexSoftware/mupdf/blob/1.26.10/source/pdf/pdf-xref.c)
+and [structure-tree handling](https://github.com/ArtifexSoftware/mupdf/blob/1.26.10/source/pdf/pdf-op-run.c).
+These are input-document issues, not an Excel encoding or CLI-path error.
+
+A successful review means the requested page/text/classification checks completed,
+not that the PDF is strictly conformant, fully accessible or visually verified.
+Do not silently suppress diagnostics or rewrite the input PDF to make these flags
+look cleaner. Keep the originals and diagnostics for a separate validation task
+if strict conformance or accessibility is required.
+
 ## ZIP checks and run outcome
 
 Reading a selected ZIP member through EOF verifies its CRC. With `--check-zip-crc`,
@@ -94,6 +114,12 @@ The original value must be retained successfully or export fails explicitly.
 investigation can distinguish a long path from repeated parser warnings without
 guessing from a generic cell-limit error. No input values are printed to the
 console to describe these adjustments.
+
+Adjustment reasons overlap: one cell can exceed both the text-length and line-feed
+limits. Thus reason counts need not sum to `excel_text_cells_adjusted`. An adjusted
+diagnostic cell does not imply an omitted PDF/page, a changed page class or a
+processing error. Keep the uniquely named `.jsonl` sidecar with the matching
+workbook, including when copying, renaming or retaining previous reports.
 
 All export stages share a cleanup boundary: close row generators, worksheet XML
 writers and the XLSX ZIP handle before deleting temporary files. Failure injection

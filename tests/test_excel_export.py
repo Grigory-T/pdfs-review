@@ -173,6 +173,22 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(self.output.read_bytes(), b"previous output")
         self.assertEqual(list(self.outdir.iterdir()), [self.output])
 
+    def test_failed_replacement_keeps_existing_lossless_details(self):
+        self.write_spools(parser_warnings="Original synthetic warning\n" * 2000)
+        original_result = self.build()
+        old_workbook = self.output.read_bytes()
+        old_details = self.outdir / original_result["cell_details_file"]
+        old_values = old_details.read_bytes()
+
+        self.write_spools(parser_warnings="Different synthetic warning\n" * 3000)
+        with mock.patch.object(app.os, "replace", side_effect=PermissionError("locked")):
+            with self.assertRaises(PermissionError):
+                self.build()
+
+        self.assertEqual(self.output.read_bytes(), old_workbook)
+        self.assertEqual(old_details.read_bytes(), old_values)
+        self.assertEqual(set(self.outdir.iterdir()), {self.output, old_details})
+
     def test_report_write_failure_is_not_silently_ignored(self):
         self.write_spools(parser_warnings="x" * 40000)
         with mock.patch.object(app.ExcelText, "cell", side_effect=OSError("details unavailable")):
@@ -204,6 +220,66 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(summary["settings"]["zip_encoding"], "cp437")
         self.assertFalse(summary["settings"]["check_zip_crc"])
         self.assertIn("WARNING: 1 cells", stdout.getvalue())
+
+    def test_multiple_warning_previews_do_not_change_pdf_results(self):
+        import fitz
+
+        diagnostics = [
+            "Repeated synthetic object warning\n" * 1800,
+            "Repeated synthetic structure warning\n" * 1400,
+            "Synthetic warning\n" * 300,
+            "",
+        ]
+        inputs = self.root / "inputs"
+        inputs.mkdir()
+        with fitz.open() as doc:
+            for _ in range(2):
+                doc.new_page().insert_text(
+                    (30, 40),
+                    "Synthetic regression document with sufficient text for classification.",
+                )
+            data = doc.tobytes()
+        for index in range(len(diagnostics)):
+            (inputs / f"sample-{index}.pdf").write_bytes(data)
+
+        with (
+            mock.patch.object(app, "PROJECT_DIR", self.root),
+            mock.patch.object(fitz.TOOLS, "mupdf_warnings", side_effect=diagnostics),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(app.run(["--root", str(inputs), "--output", str(self.output)]), 0)
+
+        summary = json.loads(self.output.with_name("review-summary.json").read_text())
+        self.assertEqual(summary["errors"], 0)
+        self.assertEqual(summary["pdfs_found"], 4)
+        self.assertEqual(summary["pdfs_readable"], 4)
+        self.assertEqual(summary["pages"], 8)
+        self.assertEqual(summary["rows"], 8)
+        self.assertEqual(summary["classes"], {"digital": 8})
+        self.assertEqual(summary["readiness"], {"READY_WITH_TEXT": 4})
+        self.assertEqual(summary["parser_warnings"], sum(len(d.splitlines()) for d in diagnostics))
+        self.assertEqual(summary["excel_text_cells_adjusted"], 3)
+        self.assertEqual(summary["excel_text_fields"], {"pdf_files.parser_warnings": 3})
+        self.assertEqual(summary["excel_text_reasons"], {"text_length": 2, "line_feeds": 3})
+        details = [
+            json.loads(line)
+            for line in (self.outdir / summary["cell_details_file"]).read_text().splitlines()
+        ]
+        self.assertEqual([d["id"] for d in details], [1, 2, 3])
+        self.assertEqual([d["pdf_id"] for d in details], [1, 2, 3])
+        self.assertEqual([d["excel_row"] for d in details], [7, 8, 9])
+        self.assertEqual([d["value"] for d in details], diagnostics[:3])
+        workbook = load_workbook(self.output)
+        try:
+            sheet = workbook["pdf_files"]
+            column = next(c.column for c in sheet[6] if c.value == "parser_warnings")
+            for index in range(3):
+                cell = sheet.cell(7 + index, column)
+                self.assertIn(f"{summary['cell_details_file']} #{index + 1};", cell.value)
+                self.assertLessEqual(app.utf16_units(cell.value), 32767)
+            self.assertIsNone(sheet.cell(10, column).value)
+        finally:
+            workbook.close()
 
     def test_locked_output_is_rejected_before_scan(self):
         self.outdir.mkdir()
