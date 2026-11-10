@@ -5,32 +5,77 @@ folders and PDFs inside ZIP, 7z and RAR archives, including archives nested in a
 order. Other file extensions are skipped normally. An archive may contain zero,
 one or many PDFs.
 
-## Run
+## Windows: download, edit TXT, run BAT
 
-Requirements: Windows or Linux, installed [uv](https://docs.astral.sh/uv/), and
-Python 3.11–3.14. RAR decompression also needs 7-Zip, unrar or unar. On Windows,
-the usual `C:\Program Files\7-Zip\7z.exe` installation is discovered automatically.
-ZIP and 7z processing do not need an external archive application.
+[Download the Windows ZIP](../../releases/latest/download/pdfs-review-windows-x64.zip)
+· [Releases and checksums](../../releases/latest)
 
-```powershell
-git clone https://github.com/Grigory-T/pdfs-review.git
-Set-Location .\pdfs-review
-.\RUN.bat --root "C:\Data\inputs"
+1. Extract the whole ZIP into a private, writable **local** folder.
+2. Open `pdfs-review.txt` in Windows Notepad, set `folder`, and save.
+3. Double-click `pdfs-review.bat`. Use this same BAT file for every review.
+
+No installed Python, uv, 7-Zip or administrator rights are needed. First start
+downloads the fixed, checksum-verified Python/uv/packages/archive backend. Later
+unchanged starts work offline, without invoking uv or checking for updates.
+Windows x86-64 and 64-bit Windows PowerShell 5.1 are required. Network/proxy access
+to the official component sources is needed for first setup only.
+
+This follows [Folder Review](https://github.com/Grigory-T/folder-review)'s current
+portable startup. Download the **Windows release ZIP**, not GitHub's source ZIP.
+
+```text
+pdfs-review.bat             the normal entry point
+pdfs-review.txt             editable input and analysis settings
+RUN.bat                    alias for the same entry point
+support/                   verified source and local runtime/state
+pdfs-review-<timestamp>.xlsx page statistics and per-PDF readiness
 ```
 
-For routine use, set `ROOT_FOLDER` near the top of `pdfs_review.py`, then run
-`RUN.bat`. The launcher creates a local `.venv` and installs the locked
-dependencies. It uses an installed Python without downloading another version.
-First-time dependency installation needs package access.
+Reports, summaries, errors reports and any lossless JSONL companions stay beside
+the BAT file. Timestamped filenames preserve earlier results automatically.
+Runtime, cache, setup downloads and temporary work stay under `support/state/`,
+not AppData/system temp. Only one operation may use the prepared folder at a time.
+Normal completion and controlled failures remove temporary scan work; a hard
+crash may leave private `work-*` directories. Close all runs before cleaning them.
 
-On Linux:
+Keep the whole prepared folder together when moving it: the local venv is rebuilt
+from the retained cache offline. An incomplete moved cache fails clearly. For an
+upgrade or repair, extract a fresh release rather than mixing support files.
+Input can be local, mapped-drive or UNC/SMB. Code, runtime and results stay local.
+The support folder is excluded from self-scans and cannot itself be selected as input.
+
+### TXT settings
+
+Paste paths literally, with no escaping. Quoted paths, percent signs, Unicode,
+UTF-8 and BOM UTF-16 are supported. Relative input paths are relative to the TXT.
+Unknown, duplicate and invalid settings fail before scanning. Edit values only,
+keeping the `[review]` section. Optional analysis thresholds and safety limits
+match the existing defaults documented below.
+
+```ini
+[review]
+folder = C:\Data\inputs
+report = pdfs-review.xlsx
+```
+
+`report` is a base filename, not a path; a timestamp is always appended. The
+supplied TXT lists all supported options and permitted values. `diagnostics=no`
+keeps the optional setup journal off; PDF summary/error reports are still produced.
+`pdfs-review.bat --no-pause` is available for scripted runs. The portable BAT does
+not accept the old `--root` scan arguments: edit the TXT or use the source CLI.
+
+### Source CLI (Windows or Linux development)
+
+An installed [uv](https://docs.astral.sh/uv/) and Python 3.11–3.14 are required
+only for source development. RAR support additionally needs installed 7-Zip,
+unrar or unar. The existing CLI and `ROOT_FOLDER` override remain available:
 
 ```sh
 uv sync --frozen --no-dev
 uv run python pdfs_review.py --root /data/inputs
 ```
 
-Results beside the script:
+Source CLI results beside the script by default:
 
 - `pdfs-review.xlsx`: `pdf_pages` (page detail) and `pdf_files` (one row per PDF occurrence).
 - `pdfs-review-summary.json`: counts, class/readiness totals and elapsed time.
@@ -41,7 +86,8 @@ Results beside the script:
 Use `--output` to change the result location, or `--timestamp-output` to preserve
 earlier workbooks without replacing a file open in Excel. Exit codes: `0` for a completed run
 without errors, `2` for a saved workbook with failures, `1` for a fatal failure,
-and `130` for interruption. Non-PDF files and archives with no PDFs are not errors.
+and `130` for interruption. Portable setup/environment failures return `10`, BAT
+launcher failures `30`. Non-PDF files and archives with no PDFs are not errors.
 Excel-safe previews are reported as export warnings, not PDF failures.
 
 ## Table
@@ -160,14 +206,24 @@ local checkout and change the input path, CLI defaults or a small configuration
 section. Keep source documents and generated reports out of Git.
 
 This repository is the canonical development base. Folder Review supplies the
-hierarchy/presentation reference, not its worker count or dataset-specific acceptance
-rules. See [development and migration decisions](docs/development.md). Local context
+portable startup and hierarchy reference, not its worker count, comparison/duplicate
+features or newer report layout. The PDF parser, page/file row grain and established
+flat-table format remain unchanged. See [development and migration decisions](docs/development.md). Local context
 belongs in ignored `.local/`, never in public commits. Do not run simultaneous
 reviews from the same checkout because they share the local spool files.
 
 ```sh
 uv run python -m unittest discover -s tests -v
+python scripts/build_portable.py --output dist
 ```
+
+The deterministic source-only release ZIP uses `portable/pins.json`, hashed
+requirements exported from `uv.lock`, and a source integrity manifest. Runtime
+downloads are fixed and verified before use. The launcher is adapted from the
+MIT-licensed reference, with full attribution in `portable/UPSTREAM_LICENSE.txt`.
+Build a clean release using `python scripts/build_portable.py --output dist --release`.
+User settings never select different runtime/package versions. These checks are
+not an OS sandbox; use an isolated environment for hostile documents/archives.
 
 ## License
 

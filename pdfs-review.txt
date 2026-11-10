@@ -1,0 +1,32 @@
+# SETTINGS - edit values, save, then double-click pdfs-review.bat.
+[review]
+folder =
+report = pdfs-review.xlsx
+check_zip_crc = no
+zip_encoding = cp437
+diagnostics = no
+max_depth = 20
+max_extracted_gib = 100
+max_pdf_gib = 2
+max_pages = 10000
+text_threshold = 40
+img_cover_threshold = 0.90
+min_img_frac = 0.005
+vector_threshold = 100
+
+# OPTIONS
+# check_zip_crc: no | yes (yes also CRC-checks skipped non-PDF ZIP members)
+# diagnostics: no | yes (optional setup journal only; PDF reports always retained)
+# zip_encoding: cp437 (ZIP standard), cp866, cp1251, or another Python text encoding
+
+# NOTES
+# folder: required local, mapped-drive or UNC input folder. Quotes are accepted.
+# Paste paths literally. Do not escape backslashes or percent signs.
+# Relative input paths are relative to this TXT file. UTF-8 / BOM UTF-16 accepted.
+# report: base filename only. A timestamp is ALWAYS added; old reports are retained.
+# All reports and lossless diagnostic sidecars stay beside the BAT file.
+# Defaults preserve the established PDF classification and archive safety limits.
+# max_depth/max_pages: positive integers. GiB limits: positive finite numbers.
+# text_threshold/vector_threshold: nonnegative integers. Image fractions: 0 through 1.
+# diagnostics=yes creates a bounded neutral setup journal under support/state.
+# Never put personal files in support. Run from a private, writable LOCAL folder.

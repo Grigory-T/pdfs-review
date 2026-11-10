@@ -41,7 +41,7 @@ ZIP/7z/RAR order, solid 7z, duplicate members, ten archive levels, Unicode/legac
 ZIP encodings, long physical/logical paths, path-safe extraction, literal Excel
 strings, each page class, readiness states, errors and configured limits.
 
-For a launcher change, run the test suite and a launcher smoke test on Windows
+For a launcher change, run the test suite and portable ZIP acceptance on Windows
 using synthetic inputs. Verify both sheets' values, formulas and flat-table style.
 Do not claim Windows acceptance when that machine is unavailable. Recheck public
 staged files for private paths, hostnames, logs, credentials and datasets before
@@ -55,13 +55,25 @@ distribution share. Generic PowerShell example:
 
 ```powershell
 Set-Location "C:\Projects"
-& robocopy.exe "D:\ToolDelivery\pdfs-review" ".\pdfs-review" /E /R:2 /W:1 /XJ /XD .git .venv .runtime .local inputs outputs
+& robocopy.exe "D:\ToolDelivery\pdfs-review" ".\pdfs-review" /E /R:2 /W:1 /XJ
 if ($LASTEXITCODE -ge 8) { throw "robocopy failed with exit code $LASTEXITCODE" }
 Set-Location ".\pdfs-review"
-.\RUN.bat --root "C:\Data\inputs"
+notepad.exe .\pdfs-review.txt
+.\pdfs-review.bat
 ```
 
-Replace only the source, local project and input paths. `/E` preserves destination
+Copy an extracted Windows release to a NEW destination, not over an older release.
+Set the input in TXT. `/E` preserves destination
 extras; it does not delete an existing input folder or workbook. Robocopy codes
-below 8 are nonfatal. `RUN.bat` resolves installed `uv`, creates local `.venv`,
-keeps caches/temp beside the code and forwards the Python exit code.
+below 8 are nonfatal. `pdfs-review.bat` bootstraps the fixed local runtime once;
+subsequent starts are offline. `RUN.bat` is an alias, not a second setup path.
+
+## Selected portable ideas
+
+The current Folder Review source was consulted read-only. Reuse its reviewed
+source-only portable bootstrap, literal TXT settings, pinned hashed downloads,
+offline recurring runs, workspace lock, local state and timestamped reports.
+Do not import its scanner, workers, comparison state, duplicate hashing, GUI/EXE
+history or changed report layout. The release entry point supplies layout/settings
+to the same `pdfs_review.run()` used by the source CLI. PDF/archive dependency
+versions and classification thresholds remain unchanged.

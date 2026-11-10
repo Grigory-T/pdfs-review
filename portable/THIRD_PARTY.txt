@@ -1,0 +1,19 @@
+PDFs Review is AGPL-3.0-or-later. See LICENSE. Its portable launcher/build logic is
+adapted from Folder Review and portable-python (MIT); full notices are retained
+in UPSTREAM_LICENSE.txt. The delivery ZIP contains reviewed source text only,
+not downloaded executables, installed packages or a prepared Python environment.
+
+First setup uses official sources and fixed pins in pins.json and requirements.txt:
+uv 0.13.1: Apache-2.0 OR MIT, https://github.com/astral-sh/uv
+CPython 3.13.16: PSF/bundled terms, https://docs.python.org/3.13/license.html
+python-build-standalone: https://github.com/astral-sh/python-build-standalone
+7-Zip 26.04: LGPL/BSD/unRAR terms, https://www.7-zip.org/license.txt
+7-Zip source: https://github.com/ip7z/7zip/releases/download/26.04/7z2604-src.tar.xz
+PyMuPDF 1.26.5: AGPL or commercial; https://pymupdf.readthedocs.io/en/latest/about.html
+All installed Python package notices: support/state/venv dist-info directories.
+Interpreter notices: support/state/python. 7-Zip: support/state/backend/License.txt.
+
+The verified 7zr.exe is setup-only and needs standard Windows x64 WoW64 support.
+It extracts only the pinned x64 7z.exe, 7z.dll and license; no installer is run.
+Sharing a prepared runtime instead of this source ZIP entails the downloaded
+components' own license/source obligations. Do not omit their notices.

@@ -38,6 +38,8 @@ from py7zr.io import Py7zIO, WriterFactory
 # Configuration: edit this path for a routine run. CLI options override it.
 ROOT_FOLDER = "PASTE_FOLDER_PATH_HERE"
 PROJECT_DIR = Path(__file__).resolve().parent
+RUNTIME_DIR: Path | None = None  # Portable entry point supplies a per-run local workspace.
+SUPPORT_DIR: Path | None = None
 ARCHIVE_SUFFIXES = {".zip", ".7z", ".rar"}
 MAX_ARCHIVE_DEPTH = 20
 MAX_ARCHIVE_MEMBERS = 100_000
@@ -1016,7 +1018,7 @@ class Review:
             children = []
             for entry in entries:
                 path = directory / entry.name
-                if path == self.args.output or path == self.args.runtime:
+                if path == self.args.output or path == self.args.runtime or path == SUPPORT_DIR:
                     continue
                 levels = prefix + (entry.name,)
                 try:
@@ -1126,7 +1128,9 @@ def run(argv=None):
     if args.timestamp_output:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         args.output = args.output.with_name(f"{args.output.stem}-{stamp}{args.output.suffix}")
-    args.runtime = PROJECT_DIR / ".runtime"
+    args.runtime = RUNTIME_DIR if RUNTIME_DIR is not None else PROJECT_DIR / ".runtime"
+    if SUPPORT_DIR is not None and root.resolve().is_relative_to(SUPPORT_DIR.resolve()):
+        raise ValueError("The tool support folder cannot be used as input")
     if not os.path.isdir(fs_path(root)):
         raise ValueError("Input folder is unavailable")
     if args.output.suffix.casefold() != ".xlsx":
